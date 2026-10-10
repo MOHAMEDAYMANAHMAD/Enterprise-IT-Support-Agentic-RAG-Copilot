@@ -1,6 +1,8 @@
 import logging
+import re
 from typing import Literal
-from langchain_openai import ChatOpenAI
+from pydantic import TypeAdapter
+from langchain_groq import ChatGroq
 from langchain_tavily import TavilySearch
 from langgraph.graph import StateGraph, START, END
 from app.core.config import get_settings
@@ -16,14 +18,39 @@ _web_search = None
 def llm():
     global _llm
     if _llm is None:
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing")
-        _llm = ChatOpenAI(
-            model=settings.openai_model,
+        if not settings.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY is missing")
+        _llm = ChatGroq(
+            model=settings.groq_model,
             temperature=0,
-            api_key=settings.openai_api_key,
+            api_key=settings.groq_api_key,
         )
     return _llm
+
+
+def _extract_json(text: str) -> str:
+    cleaned = re.sub(r"```(?:json)?", "", text).strip()
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object found in model output: {text[:200]}")
+    return match.group(0)
+
+
+def structured(schema, prompt: str):
+    """Structured output with fallback for Groq tool-call flakiness.
+
+    Primary path is function_calling; if the model returns plain JSON text
+    instead of a tool call (Groq 400 tool_use_failed), parse it directly.
+    """
+    try:
+        return llm().with_structured_output(schema, method="function_calling").invoke(prompt)
+    except Exception as exc:
+        logger.warning("Structured tool call failed, falling back to JSON parse: %s", exc)
+        try:
+            raw = llm().invoke(prompt).content
+            return TypeAdapter(schema).validate_json(_extract_json(raw))
+        except Exception:
+            raise exc from None
 
 def web_search_tool():
     global _web_search
@@ -43,8 +70,7 @@ def add_trace(state: AgentState, message: str):
     return [*state.get("trace", []), message]
 
 def route_question(state: AgentState):
-    router = llm().with_structured_output(RouteDecision, method="json_mode")
-    decision = router.invoke(f"""
+    decision = structured(RouteDecision, f"""
 You route messages for an enterprise IT support assistant.
 Use kb for questions about company IT policies, VPN, password reset, MFA, laptop setup,
 software access, security, email, devices, troubleshooting, or technology support.
@@ -62,9 +88,8 @@ def retrieve_kb(state: AgentState):
     return {"kb_docs": docs, "trace": add_trace(state, f"Private KB retrieval → {len(docs)} chunks")}
 
 def grade_kb(state: AgentState):
-    grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
     context = "\n\n".join(f"Source: {d.metadata.get('source','unknown')}\n{d.page_content}" for d in state["kb_docs"])
-    grade = grader.invoke(f"""
+    grade = structured(EvidenceGrade, f"""
 You grade evidence for an enterprise IT support assistant.
 Question: {state['question']}
 Private company KB evidence:\n{context}
@@ -96,8 +121,7 @@ def search_web(state: AgentState):
     }
 
 def grade_web(state: AgentState):
-    grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
-    grade = grader.invoke(f"""
+    grade = structured(EvidenceGrade, f"""
 Question: {state['question']}
 Web evidence:\n{state['web_results']}
 Return good if the evidence is sufficient and directly relevant; otherwise weak.

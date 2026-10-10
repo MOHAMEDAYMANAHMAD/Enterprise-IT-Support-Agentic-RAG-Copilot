@@ -1,17 +1,19 @@
-import time
-from pinecone import Pinecone , ServerlessSpec
-from langchain_openai import OpenAIEmbeddings
-from langchain_pinecone import PineconeVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
+from langchain_qdrant import QdrantVectorStore
 from app.core.config import get_settings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
 
 settings = get_settings()
 
 
 _embeddings = None
 _vectorstore = None
-
+_client = None
 
 EMBEDDING_DIMENSIONS = {
+    "gemini-embedding-001": 1536,
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072,
     "text-embedding-ada-002": 1536,
@@ -36,9 +38,11 @@ def get_embedding_dimension(model_name: str | None = None) -> int:
         return 1536
     if "all-minilm" in normalized:
         return 384
+    if "gemini-embedding-001" in normalized:
+            return 1536
 
     raise ValueError(
-        f"Unsupported embedding model '{model_name or settings.embedding_model}' for Pinecone. "
+        f"Unsupported embedding model '{model_name or settings.embedding_model}' for Qdrant. "
         "Add the matching dimension to EMBEDDING_DIMENSIONS."
     )
 
@@ -47,48 +51,42 @@ def get_embedding_dimension(model_name: str | None = None) -> int:
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing")
-        _embeddings = OpenAIEmbeddings(
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing")
+        _embeddings = GoogleGenerativeAIEmbeddings(
             model=settings.embedding_model,
-            api_key=settings.openai_api_key,
+            api_key=settings.gemini_api_key,
+            output_dimensionality=1536
         )
     return _embeddings
 
 
 
 
-def ensure_index():
-    if not settings.pinecone_api_key:
-        raise RuntimeError("PINECONE_API_KEY is missing")
+def get_client() -> QdrantClient:
+    global _client
+    if _client is None:
+        kwargs = {"url": settings.qdrant_url}
+        if settings.qdrant_api_key:
+            kwargs["api_key"] = settings.qdrant_api_key
+        _client = QdrantClient(**kwargs)
+    return _client
 
+
+
+def ensure_collection():
+    client = get_client()
     desired_dimension = get_embedding_dimension()
-    pc = Pinecone(api_key=settings.pinecone_api_key)
-    names = [x["name"] for x in pc.list_indexes()]
 
-    if settings.pinecone_index_name in names:
-        index_info = pc.describe_index(settings.pinecone_index_name)
-        current_dimension = getattr(index_info, "dimension", None)
-        if current_dimension is None and isinstance(index_info, dict):
-            current_dimension = index_info.get("dimension")
-
-        if current_dimension is not None and current_dimension != desired_dimension:
-            pc.delete_index(name=settings.pinecone_index_name)
-            while settings.pinecone_index_name in [x["name"] for x in pc.list_indexes()]:
-                time.sleep(1)
-
-    if settings.pinecone_index_name not in [x["name"] for x in pc.list_indexes()]:
-        pc.create_index(
-            name=settings.pinecone_index_name,
-            dimension=desired_dimension,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    if not client.collection_exists(settings.qdrant_collection_name):
+        client.create_collection(
+            collection_name=settings.qdrant_collection_name,
+            vectors_config=VectorParams(
+                size=desired_dimension,
+                distance=Distance.COSINE,
+            ),
         )
-        while not pc.describe_index(settings.pinecone_index_name).status["ready"]:
-            time.sleep(1)
-
-    return pc.Index(settings.pinecone_index_name)
-
+    return client
 
 
 
@@ -96,11 +94,11 @@ def ensure_index():
 def get_vectorstore():
     global _vectorstore
     if _vectorstore is None:
-        index = ensure_index()
-        _vectorstore = PineconeVectorStore(
-            index=index,
+        client = ensure_collection()
+        _vectorstore = QdrantVectorStore(
+            client=client,
+            collection_name=settings.qdrant_collection_name,
             embedding=get_embeddings(),
-            namespace=settings.pinecone_namespace,
         )
     return _vectorstore
 

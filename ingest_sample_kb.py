@@ -14,4 +14,4 @@ for path in files:
     all_docs.extend(load_file(path))
 chunks = chunk_documents(all_docs)
 ids = add_documents(chunks)
-print(f"Indexed {len(files)} files -> {len(chunks)} chunks -> {len(ids)} Pinecone vectors")
+print(f"Indexed {len(files)} files -> {len(chunks)} chunks -> {len(ids)} Qdrant vectors")

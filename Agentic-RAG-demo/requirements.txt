@@ -11,3 +11,7 @@ pinecone==7.3.0
 sentence-transformers==6.0.0
 beautifulsoup4==4.15.0
 python-dotenv==1.2.3
+langchain-qdrant==1.1.0
+qdrant-client==1.19.1
+google-genai==2.29.0
+
